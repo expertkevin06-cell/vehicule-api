@@ -1,0 +1,180 @@
+'use strict';
+
+const path = require('path');
+const { URL } = require('url');
+const { Router } = require('./lib/router');
+const { TtlCache } = require('./lib/cache');
+const { createNhtsaService } = require('./services/nhtsa');
+const { createCarQueryService } = require('./services/carquery');
+const { createAuthService } = require('./services/auth');
+const { createFileStore } = require('./lib/store');
+const regions = require('./config/regions');
+
+function sendJson(res, statusCode, payload) {
+  const body = JSON.stringify(payload);
+  res.writeHead(statusCode, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      const raw = Buffer.concat(chunks).toString('utf8').trim();
+      if (!raw) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(raw));
+      } catch (err) {
+        reject(Object.assign(new Error('Invalid JSON body'), { statusCode: 400 }));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function getBearerToken(req) {
+  const header = req.headers.authorization || '';
+  return header.startsWith('Bearer ') ? header.slice('Bearer '.length) : null;
+}
+
+function overrideKey(make, model) {
+  return `${String(make).toLowerCase()}::${String(model).toLowerCase()}`;
+}
+
+/**
+ * Builds the HTTP request listener (the "app"). Services can be injected
+ * for testing; in production createApp() uses the real NHTSA/CarQuery
+ * services with a shared in-memory cache.
+ */
+function createApp({ nhtsaService, carQueryService, cache, authService, overridesStore } = {}) {
+  const sharedCache = cache || new TtlCache();
+  const nhtsa = nhtsaService || createNhtsaService({ cache: sharedCache });
+  const carQuery = carQueryService || createCarQueryService({ cache: sharedCache });
+  const auth = authService || createAuthService();
+  const overrides = overridesStore || createFileStore(path.join(__dirname, '..', 'data', 'overrides.json'));
+
+  const router = new Router();
+
+  router.get('/health', (req, res) => {
+    sendJson(res, 200, { status: 'ok' });
+  });
+
+  router.get('/api/regions', (req, res) => {
+    sendJson(res, 200, { regions: regions.REGIONS });
+  });
+
+  router.get('/api/makes', async (req, res) => {
+    const region = req.query.get('region');
+    if (region && !regions.isValidRegion(region)) {
+      sendJson(res, 400, { error: `Invalid region. Use one of: ${regions.REGIONS.join(', ')}` });
+      return;
+    }
+    const makes = await nhtsa.getAllMakes();
+    const filtered = region ? regions.filterMakesByRegion(makes, region) : makes;
+    sendJson(res, 200, { count: filtered.length, region: region || 'ALL', makes: filtered });
+  });
+
+  router.get('/api/makes/:make/models', async (req, res, params) => {
+    const year = req.query.get('year');
+    const models = year
+      ? await nhtsa.getModelsForMakeYear(params.make, year)
+      : await nhtsa.getModelsForMake(params.make);
+    sendJson(res, 200, { make: params.make, year: year || null, count: models.length, models });
+  });
+
+  router.get('/api/makes/:make/models/:model/specs', async (req, res, params) => {
+    const year = req.query.get('year');
+    const override = overrides.get(overrideKey(params.make, params.model));
+    if (override) {
+      sendJson(res, 200, {
+        make: params.make,
+        model: params.model,
+        year: year || null,
+        count: override.specs.length,
+        specs: override.specs,
+        source: 'admin-override',
+        updatedAt: override.updatedAt,
+      });
+      return;
+    }
+    const specs = await carQuery.getTrims(params.make, params.model, year);
+    if (specs.length === 0) {
+      sendJson(res, 404, { error: `No specs found for ${params.make} ${params.model}` });
+      return;
+    }
+    sendJson(res, 200, {
+      make: params.make,
+      model: params.model,
+      year: year || null,
+      count: specs.length,
+      specs,
+      source: 'carquery',
+    });
+  });
+
+  // --- Admin: PIN login + technical-data overrides ---
+
+  router.post('/api/admin/login', async (req, res) => {
+    const body = await readJsonBody(req);
+    const token = auth.login(body.pin);
+    if (!token) {
+      sendJson(res, 401, { error: 'Code PIN invalide' });
+      return;
+    }
+    sendJson(res, 200, { token, expiresInMs: 2 * 60 * 60 * 1000 });
+  });
+
+  router.put('/api/makes/:make/models/:model/specs', async (req, res, params) => {
+    if (!auth.verify(getBearerToken(req))) {
+      sendJson(res, 401, { error: 'Non autorisé — connexion admin requise' });
+      return;
+    }
+    const body = await readJsonBody(req);
+    if (!Array.isArray(body.specs) || body.specs.length === 0) {
+      sendJson(res, 400, { error: 'Le champ "specs" (tableau non vide) est requis' });
+      return;
+    }
+    const saved = {
+      make: params.make,
+      model: params.model,
+      specs: body.specs,
+      updatedAt: new Date().toISOString(),
+    };
+    overrides.set(overrideKey(params.make, params.model), saved);
+    sendJson(res, 200, { saved: true, ...saved, source: 'admin-override' });
+  });
+
+  router.get('/api/vin/:vin/decode', async (req, res, params) => {
+    if (!params.vin || params.vin.trim().length === 0) {
+      sendJson(res, 400, { error: 'VIN is required' });
+      return;
+    }
+    const decoded = await nhtsa.decodeVin(params.vin);
+    sendJson(res, 200, { vin: params.vin, decoded });
+  });
+
+  return function requestListener(req, res) {
+    const url = new URL(req.url, 'http://internal');
+    req.query = url.searchParams;
+
+    const match = router.match(req.method, url.pathname);
+    if (!match) {
+      sendJson(res, 404, { error: `No route for ${req.method} ${url.pathname}` });
+      return;
+    }
+
+    Promise.resolve(match.handler(req, res, match.params)).catch((err) => {
+      const statusCode = err.statusCode || (err.upstream ? 502 : 500);
+      sendJson(res, statusCode, { error: err.message || 'Internal error' });
+    });
+  };
+}
+
+module.exports = { createApp };
