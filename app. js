@@ -4,7 +4,7 @@ function createApp() {
   const app = express();
   app.use(express.json());
 
-  // C'est ici que l'on définit la route /health
+  // Définit explicitement la route /health ici
   app.get('/health', (req, res) => {
     res.status(200).json({ status: 'ok' });
   });
